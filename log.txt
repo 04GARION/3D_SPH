@@ -1,0 +1,8 @@
+2.15
+	Finished building ComputeShader, Params, ParticleSystem.
+	The buildings of global and Renderer is moving on part by part.
+2.19
+	Finished particle solving and rendering.
+	Finished KernelFunc in 3D.
+	Finished Shader, Material, in hpp & cpp.
+	Note that variables in Material are not initialted.

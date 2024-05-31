@@ -1,0 +1,197 @@
+#version 460 core
+
+const float gGravity=9.8;
+const float gDeltaT=4e-4;
+const float gEps=1e-5;
+const float gMaxVelocity=100.0f;
+const float gVelocityAttenuation=0.9;
+
+uniform uint pass;
+uniform uint gLocalSize;
+
+uniform uvec3 BlockNum;
+uniform int ParticleNum;
+uniform vec3 BlockSize;
+uniform vec3 ContainerLowerBound;
+uniform vec3 ContainerUpperBound;
+uniform int BlockIdOffs[27];
+
+uniform float gSupportRadius;
+uniform vec3 gGravityDir;
+uniform highp float gDensity0;
+uniform highp float gVolume;
+uniform highp float gMass;
+uniform highp float gStiffness;
+uniform highp float gExponent;
+uniform highp float gViscosity;
+
+uniform vec3 gExternalAcceleration;
+
+layout (local_size_x=512,local_size_y=1,local_size_z=1) in;
+
+struct ParticleInfo
+{
+	vec3 position;
+	vec3 velocity;
+	vec3 acceleration;
+	highp float density;
+	highp float pressure;
+	highp float param;
+	highp uint BlockId;
+};
+
+struct NeighborInfo
+{
+	vec3 radius;
+	float distance;
+	int NeighborId;
+};
+
+layout (std140,binding=4) buffer ParticleInfos
+{
+	ParticleInfo particles[];
+};
+
+layout (binding=5) buffer BlockExtens
+{
+	uvec2 extens[];
+};
+
+layout (rgba32f,binding=0) uniform image2D img;
+
+uniform sampler1D KernelBuffer;
+
+void EulerIntegration(inout ParticleInfo p)
+{
+	p.velocity=p.velocity+gDeltaT*p.acceleration;
+	p.velocity=clamp(p.velocity,vec3(-gMaxVelocity),vec3(gMaxVelocity));
+	p.position=p.position+gDeltaT*p.velocity;
+}
+
+void ComputeDensityPressure(inout ParticleInfo p)
+{
+	uint ParticleId=gl_GlobalInvocationID.x;
+
+	for (int i=0;i<BlockIdOffs.length();i++)
+	{
+		uint bIdj=p.BlockId+BlockIdOffs[i];
+		for (uint j=extens[bIdj].x;j<extens[bIdj].y;j++)
+		{
+			vec3 radius=p.position-particles[j].position;
+			float distance=length(radius);
+			if (ParticleId!=j&&distance<=gSupportRadius)
+			{
+				p.density+=texture(KernelBuffer,distance/gSupportRadius).r;
+			}
+		}
+	}
+	p.density*=(gVolume*gDensity0);
+	p.density=max(p.density,gDensity0);
+	p.pressure=gStiffness*(pow(p.density/gDensity0,gExponent)-1.0f);
+	p.param=p.pressure/pow(p.density,2);
+}
+
+void ComputeAcceleration(inout ParticleInfo p)
+{
+	uint ParticleId=gl_GlobalInvocationID.x;
+	if (ParticleId>=ParticleNum)
+	{
+		return;
+	}
+
+	float dim=3.0f;
+	float factor=2.0f*(dim+2.0f)*gViscosity;
+	vec3 FViscosity=vec3(0.0f);
+	vec3 FPressure=vec3(0.0f);
+	for (int i=0;i<BlockIdOffs.length();i++)
+	{
+		uint bIdj=p.BlockId+BlockIdOffs[i];
+		for (uint j=extens[bIdj].x;j<extens[bIdj].y;j++)
+		{
+			vec3 radius=p.position-particles[j].position;
+			float distance=length(radius);
+			if (ParticleId!=j&&distance<=gSupportRadius)
+			{
+				float scalar=dot(p.velocity-particles[j].velocity,radius);
+				float denom=distance*distance+0.01f*gSupportRadius*gSupportRadius;
+				vec3 wGrad=texture(KernelBuffer,distance/gSupportRadius).g*radius;
+				FViscosity+=(gMass/particles[j].density)*scalar*wGrad/denom;
+				FPressure+=particles[j].density*(p.param+particles[j].param)*wGrad;
+			}
+		}
+	}
+
+	p.acceleration+=FViscosity*factor;
+	p.acceleration-=FPressure*gVolume;
+}
+
+void BoundaryTest(inout ParticleInfo p)
+{
+	bool flag=false;
+
+	if (p.position.x < ContainerLowerBound.x + gSupportRadius) {
+        p.velocity.x = abs(p.velocity.x);
+        flag = true;
+    }
+
+    if (p.position.y < ContainerLowerBound.y + gSupportRadius) {
+        p.velocity.y = abs(p.velocity.y);
+        flag = true;
+    }
+
+    if (p.position.z < ContainerLowerBound.z + gSupportRadius) {
+        p.velocity.z = abs(p.velocity.z);
+        flag = true;
+    }
+
+    if (p.position.x > ContainerUpperBound.x - gSupportRadius) {
+        p.velocity.x = -abs(p.velocity.x);
+        flag = true;
+    }
+
+    if (p.position.y > ContainerUpperBound.y - gSupportRadius) {
+        p.velocity.y = -abs(p.velocity.y);
+        flag = true;
+    }
+
+    if (p.position.z > ContainerUpperBound.z - gSupportRadius) {
+        p.velocity.z = -abs(p.velocity.z);
+        flag = true;
+    }
+
+	if (flag)
+	{
+		p.velocity*=gVelocityAttenuation;
+	}
+
+	p.position=clamp(p.position,ContainerLowerBound+vec3(gSupportRadius+gEps),ContainerUpperBound-vec3(gSupportRadius+gEps));
+	p.velocity=clamp(p.velocity,vec3(-gMaxVelocity),vec3(gMaxVelocity));
+}
+
+void ComputeBlockId(inout ParticleInfo p)
+{
+	vec3 delta=p.position-ContainerLowerBound;
+	uvec3 BlockPosition=uvec3(floor(delta/BlockSize));
+	p.BlockId=BlockPosition.z*BlockNum.x*BlockNum.y+BlockPosition.y*BlockNum.x+BlockPosition.x;
+}
+
+void main()
+{
+	uint ParticleId=gl_GlobalInvocationID.x;
+
+	if (pass==0)
+	{
+		ComputeDensityPressure(particles[ParticleId]);
+	}
+	else if (pass==1)
+	{
+		particles[ParticleId].acceleration=gGravity*gGravityDir+gExternalAcceleration;
+		ComputeAcceleration(particles[ParticleId]);
+		EulerIntegration(particles[ParticleId]);
+		BoundaryTest(particles[ParticleId]);
+		ComputeBlockId(particles[ParticleId]);
+	}
+
+	imageStore(img,ivec2(ParticleId%100,ParticleId/100),vec4(1.0f,1.0f,0.0f,1.0f));
+	return;
+}
